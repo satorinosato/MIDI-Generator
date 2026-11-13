@@ -1,0 +1,164 @@
+import argparse
+import random
+import struct
+
+TICKS_PER_BEAT = 480
+
+
+SCALES = {
+    "major":      [0, 2, 4, 5, 7, 9, 11],
+    "minor":      [0, 2, 3, 5, 7, 8, 10],
+    "dorian":     [0, 2, 3, 5, 7, 9, 10],
+    "pentatonic": [0, 2, 4, 7, 9],
+    "blues":      [0, 3, 5, 6, 7, 10],
+}
+
+NOTE_NAMES = {
+    "C": 0, "C#": 1, "D": 2, "D#": 3, "E": 4, "F": 5,
+    "F#": 6, "G": 7, "G#": 8, "A": 9, "A#": 10, "B": 11,
+}
+
+
+DURATIONS = [(0.25, 1), (0.5, 4), (1.0, 4), (1.5, 1), (2.0, 2)]
+
+BASS_PROGRESSION = [0, 4, 5, 3]
+
+
+def vlq(value: int) -> bytes:
+    """Кодирует число в формат переменной длины (Variable Length Quantity)."""
+    result = [value & 0x7F]
+    value >>= 7
+    while value:
+        result.append((value & 0x7F) | 0x80)
+        value >>= 7
+    return bytes(reversed(result))
+
+
+class Track:
+    """Один MIDI-трек: хранит события с абсолютным временем."""
+
+    def __init__(self):
+        self.events = []
+
+    def tempo(self, bpm: int):
+        mpqn = int(60_000_000 / bpm)
+        self.events.append((0, 0, b"\xFF\x51\x03" + mpqn.to_bytes(3, "big")))
+
+    def program(self, channel: int, program: int):
+        self.events.append((0, 1, bytes([0xC0 | channel, program])))
+
+    def note(self, channel: int, pitch: int, start: int, length: int, velocity: int = 90):
+        self.events.append((start, 3, bytes([0x90 | channel, pitch, velocity])))
+        self.events.append((start + length, 2, bytes([0x80 | channel, pitch, 0])))
+
+    def to_bytes(self) -> bytes:
+        events = sorted(self.events, key=lambda e: (e[0], e[1]))
+        data = bytearray()
+        last = 0
+        for tick, _, payload in events:
+            data += vlq(tick - last) + payload
+            last = tick
+        data += vlq(0) + b"\xFF\x2F\x00"
+        return b"MTrk" + struct.pack(">I", len(data)) + bytes(data)
+
+
+def build_scale_notes(root: int, intervals, low: int, high: int):
+    """Все ноты гаммы в диапазоне [low, high]."""
+    notes = []
+    for octave_base in range(0, 128, 12):
+        for step in intervals:
+            pitch = octave_base + root + step
+            if low <= pitch <= high:
+                notes.append(pitch)
+    return sorted(set(notes))
+
+
+def weighted_choice(options):
+    values, weights = zip(*options)
+    return random.choices(values, weights=weights)[0]
+
+
+def generate_melody(track: Track, scale_notes, root: int, bars: int, channel: int = 0):
+    """Случайное блуждание по гамме: чаще шагаем на соседние ноты, иногда прыгаем."""
+    total_beats = bars * 4
+    beat = 0.0
+    index = min(range(len(scale_notes)), key=lambda i: abs(scale_notes[i] - (root + 12)))
+
+    while beat < total_beats:
+        remaining = total_beats - beat
+        duration = weighted_choice(DURATIONS)
+        duration = min(duration, remaining)
+
+        
+        if random.random() > 0.12:
+            step = random.choices(
+                [-3, -2, -1, 0, 1, 2, 3],
+                weights=[1, 3, 6, 1, 6, 3, 1],
+            )[0]
+            index = max(0, min(len(scale_notes) - 1, index + step))
+            pitch = scale_notes[index]
+            velocity = random.randint(75, 105)
+            track.note(channel, pitch, int(beat * TICKS_PER_BEAT),
+                       int(duration * TICKS_PER_BEAT * 0.95), velocity)
+        beat += duration
+
+
+    tonic = min(scale_notes, key=lambda n: abs(n - (root + 12)) if (n - root) % 12 == 0 else 999)
+    track.note(channel, tonic, total_beats * TICKS_PER_BEAT, 2 * TICKS_PER_BEAT, 100)
+
+
+def generate_bass(track: Track, intervals, root: int, bars: int, channel: int = 1):
+    """Простой бас: по одной ноте на такт, ступени по прогрессии."""
+    for bar in range(bars):
+        degree = BASS_PROGRESSION[bar % len(BASS_PROGRESSION)] % len(intervals)
+        pitch = root - 12 + intervals[degree]
+        start = bar * 4 * TICKS_PER_BEAT
+        track.note(channel, pitch, start, int(3.8 * TICKS_PER_BEAT), 80)
+
+
+def write_midi(path: str, tracks):
+    header = b"MThd" + struct.pack(">IHHH", 6, 1, len(tracks), TICKS_PER_BEAT)
+    with open(path, "wb") as f:
+        f.write(header)
+        for t in tracks:
+            f.write(t.to_bytes())
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Генератор случайной мелодии в MIDI")
+    parser.add_argument("--scale", choices=SCALES.keys(), default="major", help="гамма")
+    parser.add_argument("--root", choices=NOTE_NAMES.keys(), default="C", help="тоника")
+    parser.add_argument("--tempo", type=int, default=110, help="темп (BPM)")
+    parser.add_argument("--bars", type=int, default=8, help="количество тактов")
+    parser.add_argument("--seed", type=int, default=None, help="seed для повторяемости")
+    parser.add_argument("--output", default="melody.mid", help="имя выходного файла")
+    parser.add_argument("--no-bass", action="store_true", help="без баса")
+    args = parser.parse_args()
+
+    if args.seed is not None:
+        random.seed(args.seed)
+
+    intervals = SCALES[args.scale]
+    root = 60 + NOTE_NAMES[args.root]
+    scale_notes = build_scale_notes(root % 12, intervals, root - 5, root + 19)
+
+    meta = Track()
+    meta.tempo(args.tempo)
+
+    melody = Track()
+    melody.program(0, 11) 
+    generate_melody(melody, scale_notes, root, args.bars)
+
+    tracks = [meta, melody]
+    if not args.no_bass:
+        bass = Track()
+        bass.program(1, 33)
+        generate_bass(bass, intervals, root, args.bars)
+        tracks.append(bass)
+
+    write_midi(args.output, tracks)
+    print(f"Готово! {args.root} {args.scale}, {args.tempo} BPM, {args.bars} тактов -> {args.output}")
+
+
+if __name__ == "__main__":
+    main()
